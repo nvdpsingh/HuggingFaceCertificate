@@ -1,3 +1,6 @@
+"""
+app.py - Gradio web interface for the GAIA Quiz Agent
+"""
 import os
 import requests
 import gradio as gr
@@ -6,6 +9,7 @@ from dotenv import load_dotenv
 from smolagents.agents import ToolCallingAgent
 from smolagents.tools import Tool
 from litellm import completion
+from agent import GAIAAgent
 
 # Load environment variables
 load_dotenv()
@@ -121,61 +125,53 @@ class GAIAgent:
             "answer": response
         }
 
+# Initialize the agent
+agent = GAIAAgent()
+
+def fetch_questions():
+    """Fetch all questions from the GAIA API."""
+    try:
+        response = requests.get(QUESTIONS_ENDPOINT)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def submit_answers(username, code_link, questions):
+    """Submit answers to the GAIA API."""
+    if not username or not code_link:
+        return {"error": "Please provide both username and code link."}
+    if not questions or isinstance(questions, dict) and questions.get("error"):
+        return {"error": "No questions to answer."}
+    answers = []
+    for q in questions:
+        answer = agent.process_question(q)
+        answers.append({"task_id": q["task_id"], "submitted_answer": answer})
+    payload = {
+        "username": username,
+        "code_link": code_link,
+        "answers": answers
+    }
+    try:
+        response = requests.post(SUBMIT_ENDPOINT, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 def main():
-    # Create the agent
-    agent = GAIAgent()
-    
-    # Create Gradio interface
     with gr.Blocks(title="GAIA Quiz Agent") as demo:
         gr.Markdown("# GAIA Quiz Agent")
-        
         with gr.Row():
             username = gr.Textbox(label="Hugging Face Username")
             code_link = gr.Textbox(label="Code Link (GitHub/GitLab)")
-        
-        with gr.Row():
-            model_provider = gr.Dropdown(
-                choices=["Groq"],
-                value="Groq",
-                label="Model Provider"
-            )
-        
         with gr.Row():
             fetch_btn = gr.Button("Fetch Questions")
             submit_btn = gr.Button("Submit Answers")
-        
         questions_output = gr.JSON(label="Questions")
-        answers_output = gr.JSON(label="Answers")
         submission_output = gr.JSON(label="Submission Result")
-        
-        def fetch_questions():
-            questions = agent._get_question()
-            return questions
-        
-        def submit_answers(username, code_link, questions):
-            if not username or not code_link:
-                return {"error": "Please provide both username and code link"}
-            
-            answers = []
-            for question in questions:
-                answer = agent.process_question(question)
-                answers.append(answer)
-            
-            result = agent._submit_answer(username, code_link, answers)
-            return result
-        
-        fetch_btn.click(
-            fn=fetch_questions,
-            outputs=questions_output
-        )
-        
-        submit_btn.click(
-            fn=submit_answers,
-            inputs=[username, code_link, questions_output],
-            outputs=submission_output
-        )
-    
-    # Launch the interface
+        fetch_btn.click(fn=fetch_questions, outputs=questions_output)
+        submit_btn.click(fn=submit_answers, inputs=[username, code_link, questions_output], outputs=submission_output)
     demo.launch()
 
 if __name__ == "__main__":
