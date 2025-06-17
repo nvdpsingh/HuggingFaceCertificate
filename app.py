@@ -1,0 +1,182 @@
+import os
+import requests
+import gradio as gr
+from typing import List, Dict, Optional
+from dotenv import load_dotenv
+from smolagents.agents import ToolCallingAgent
+from smolagents.tools import Tool
+from litellm import completion
+
+# Load environment variables
+load_dotenv()
+
+# API endpoints
+BASE_URL = "https://gaia-quiz-api.huggingface.co"
+QUESTIONS_ENDPOINT = f"{BASE_URL}/questions"
+SUBMIT_ENDPOINT = f"{BASE_URL}/submit"
+
+# Define custom tools as subclasses of Tool
+class SearchWebTool(Tool):
+    name = "search_web"
+    description = "Search the web for information."
+    inputs = {"query": {"type": "string", "description": "The search query."}}
+    output_type = "string"
+
+    def forward(self, query: str) -> str:
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=3))
+                return "\n".join([f"{r['title']}: {r['body']}" for r in results])
+        except Exception as e:
+            return f"Error searching web: {str(e)}"
+
+class SearchWikipediaTool(Tool):
+    name = "search_wikipedia"
+    description = "Search Wikipedia for information."
+    inputs = {"query": {"type": "string", "description": "The search query."}}
+    output_type = "string"
+
+    def forward(self, query: str) -> str:
+        try:
+            import wikipedia
+            return wikipedia.summary(query, sentences=3)
+        except Exception as e:
+            return f"Error searching Wikipedia: {str(e)}"
+
+class GetQuestionTool(Tool):
+    name = "get_question"
+    description = "Get a question from the GAIA quiz."
+    inputs = {"task_id": {"type": "string", "description": "Task ID (optional)", "nullable": True}}
+    output_type = "object"
+
+    def forward(self, task_id: str = None) -> dict:
+        if task_id:
+            response = requests.get(f"{QUESTIONS_ENDPOINT}/{task_id}")
+        else:
+            response = requests.get(QUESTIONS_ENDPOINT)
+        return response.json()
+
+class SubmitAnswerTool(Tool):
+    name = "submit_answer"
+    description = "Submit an answer to the GAIA quiz."
+    inputs = {
+        "username": {"type": "string", "description": "Hugging Face username."},
+        "code_link": {"type": "string", "description": "Code link (GitHub/GitLab)."},
+        "answers": {"type": "object", "description": "List of answers."}
+    }
+    output_type = "object"
+
+    def forward(self, username: str, code_link: str, answers: list) -> dict:
+        payload = {
+            "username": username,
+            "code_link": code_link,
+            "answers": answers
+        }
+        response = requests.post(SUBMIT_ENDPOINT, json=payload)
+        return response.json()
+
+class GAIAgent:
+    def __init__(self):
+        self.agent = ToolCallingAgent(
+            tools=self._get_tools(),
+            model=self._get_model()
+        )
+    
+    def _get_model(self):
+        # Return a function that takes messages and calls completion
+        def model(messages, **kwargs):
+            return completion(
+                model="groq/llama3-70b-8192",
+                api_key=os.getenv("GROQ_API_KEY"),
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000
+            )
+        return model
+    
+    def _get_tools(self):
+        return [
+            SearchWebTool(),
+            SearchWikipediaTool(),
+            GetQuestionTool(),
+            SubmitAnswerTool()
+        ]
+    
+    def process_question(self, question: Dict) -> Dict:
+        # Create a prompt for the agent
+        prompt = f"""
+        Question: {question['question']}
+        Task ID: {question['task_id']}
+        
+        Please analyze this question and provide a detailed answer. Use the available tools to gather information if needed.
+        """
+        
+        # Get the agent's response
+        response = self.agent.run(prompt)
+        
+        # Format the answer
+        return {
+            "task_id": question['task_id'],
+            "answer": response
+        }
+
+def main():
+    # Create the agent
+    agent = GAIAgent()
+    
+    # Create Gradio interface
+    with gr.Blocks(title="GAIA Quiz Agent") as demo:
+        gr.Markdown("# GAIA Quiz Agent")
+        
+        with gr.Row():
+            username = gr.Textbox(label="Hugging Face Username")
+            code_link = gr.Textbox(label="Code Link (GitHub/GitLab)")
+        
+        with gr.Row():
+            model_provider = gr.Dropdown(
+                choices=["Groq"],
+                value="Groq",
+                label="Model Provider"
+            )
+        
+        with gr.Row():
+            fetch_btn = gr.Button("Fetch Questions")
+            submit_btn = gr.Button("Submit Answers")
+        
+        questions_output = gr.JSON(label="Questions")
+        answers_output = gr.JSON(label="Answers")
+        submission_output = gr.JSON(label="Submission Result")
+        
+        def fetch_questions():
+            questions = agent._get_question()
+            return questions
+        
+        def submit_answers(username, code_link, questions):
+            if not username or not code_link:
+                return {"error": "Please provide both username and code link"}
+            
+            answers = []
+            for question in questions:
+                answer = agent.process_question(question)
+                answers.append(answer)
+            
+            result = agent._submit_answer(username, code_link, answers)
+            return result
+        
+        fetch_btn.click(
+            fn=fetch_questions,
+            outputs=questions_output
+        )
+        
+        submit_btn.click(
+            fn=submit_answers,
+            inputs=[username, code_link, questions_output],
+            outputs=submission_output
+        )
+    
+    # Launch the interface
+    demo.launch()
+
+if __name__ == "__main__":
+    main()
